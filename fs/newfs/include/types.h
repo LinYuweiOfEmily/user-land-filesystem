@@ -103,6 +103,7 @@ struct nfs_inode
     struct nfs_dentry* dentry;                          /* 指向该inode的父dentry */
     struct nfs_dentry* dentrys;                         /* 指向该inode的所有子dentry */
     uint8_t*           data[NFS_DATA_PER_FILE];         /* 指向数据块的指针 */
+    uint8_t*           data1;         
     int                dir_cnt;                         /* 如果是目录类型文件，下面有几个目录项 */
     int                block_allocted;                  /* 已分配数据块数量 */
 };  

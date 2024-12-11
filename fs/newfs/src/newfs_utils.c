@@ -187,6 +187,11 @@ struct nfs_inode* nfs_alloc_inode(struct nfs_dentry * dentry) {
 
     inode->dentry = dentry;
     
+    if (NFS_IS_REG(inode)) {
+        for(int i=0; i<NFS_DATA_PER_FILE; i++){
+            inode->data[i] = (uint8_t *)malloc(NFS_BLK_SZ());
+        }
+    }
     return inode;
 }
 /**
@@ -649,6 +654,183 @@ int nfs_umount() {
     free(nfs_super.map_inode);
     free(nfs_super.map_data);
     ddriver_close(NFS_DRIVER());
+
+    return NFS_ERROR_NONE;
+}
+
+
+int nfs_write_file(struct nfs_inode* inode, const char* data, int length, int offset) {
+    if (inode->size < (NFS_ROUND_UP(offset + length, NFS_BLK_SZ()) / NFS_BLK_SZ())) {
+        int nums = (NFS_ROUND_UP(offset + length, NFS_BLK_SZ()) / NFS_BLK_SZ()) - inode->size;
+        for (int i = 0; i < nums; i ++) {
+            inode->block_pointer[inode->size ++] = nfs_alloc_data();
+            if (inode->data[i]) {
+                char* initial_data = inode->data[i];
+                inode->data[i] = (uint8_t*)malloc(NFS_BLK_SZ());
+                memcpy(inode->data[i], initial_data, NFS_BLKS_SZ(inode->size - nums));
+                free(initial_data);
+            } else {
+                inode->data[i] = (uint8_t*)malloc(NFS_BLK_SZ());
+                memset(inode->data[i], 0, NFS_BLK_SZ());
+            }
+        }
+    }
+
+    if (data != NULL)
+	    memcpy(inode->data[0] + offset, data, length);
+}
+
+int nfs_read_file(struct nfs_inode* inode, char* data, int length, int offset) {
+    if (offset >= inode->size * NFS_BLK_SZ()) {
+        // Offset is out of bounds
+        return 0;
+    }
+
+    int bytes_read = 0;
+    int start_block = offset / NFS_BLK_SZ();
+    int start_offset = offset % NFS_BLK_SZ();
+
+    while (bytes_read < length && start_block < inode->size) {
+        int remaining_length = length - bytes_read;
+        int bytes_in_block = NFS_BLK_SZ() - start_offset;
+        int bytes_to_read = remaining_length < bytes_in_block ? remaining_length : bytes_in_block;
+
+        if (inode->data[start_block] == NULL) {
+            // Block has not been allocated, treat as zeros
+            memset(data + bytes_read, 0, bytes_to_read);
+        } else {
+            memcpy(data + bytes_read, inode->data[start_block] + start_offset, bytes_to_read);
+        }
+
+        bytes_read += bytes_to_read;
+        start_block++;
+        start_offset = 0; // After the first block, subsequent reads start from offset 0
+    }
+
+    return bytes_read;
+
+}
+
+
+int nfs_drop_dentry(struct nfs_inode * inode, struct nfs_dentry * dentry) {
+    boolean is_find = FALSE;
+    struct nfs_dentry* dentry_cursor;
+    dentry_cursor = inode->dentrys;
+    
+    if (dentry_cursor == dentry) {
+        inode->dentrys = dentry->brother;
+        is_find = TRUE;
+    }
+    else {
+        while (dentry_cursor)
+        {
+            if (dentry_cursor->brother == dentry) {
+                dentry_cursor->brother = dentry->brother;
+                is_find = TRUE;
+                break;
+            }
+            dentry_cursor = dentry_cursor->brother;
+        }
+    }
+    if (!is_find) {
+        return -NFS_ERROR_NOTFOUND;
+    }
+    inode->dir_cnt--;
+    return inode->dir_cnt;
+}
+
+/**
+ * @brief 删除内存中的一个inode， 暂时不释放
+ * Case 1: Reg File
+ * 
+ *                  Inode
+ *                /      \
+ *            Dentry -> Dentry (Reg Dentry)
+ *                       |
+ *                      Inode  (Reg File)
+ * 
+ *  1) Step 1. Erase Bitmap     
+ *  2) Step 2. Free Inode                      (Function of newfs_drop_inode)
+ * ------------------------------------------------------------------------
+ *  3) *Setp 3. Free Dentry belonging to Inode (Outsider)
+ * ========================================================================
+ * Case 2: Dir
+ *                  Inode
+ *                /      \
+ *            Dentry -> Dentry (Dir Dentry)
+ *                       |
+ *                      Inode  (Dir)
+ *                    /     \
+ *                Dentry -> Dentry
+ * 
+ *   Recursive
+ * @param inode 
+ * @return int 
+ */
+int nfs_drop_inode(struct nfs_inode * inode) {
+    struct nfs_dentry*  dentry_cursor;
+    struct nfs_dentry*  dentry_to_free;
+    struct nfs_inode*   inode_cursor;
+
+    int byte_cursor = 0; 
+    int bit_cursor  = 0; 
+    int ino_cursor  = 0;
+    int data_cursor = 0;
+    boolean is_find = FALSE;
+
+    if (inode == nfs_super.root_dentry->inode) {
+        return NFS_ERROR_INVAL;
+    }
+
+    if (NFS_IS_DIR(inode)) {
+        dentry_cursor = inode->dentrys;
+                                                      /* 递归向下drop */
+        while (dentry_cursor)
+        {   
+            inode_cursor = dentry_cursor->inode;
+            nfs_drop_inode(inode_cursor);
+            nfs_drop_dentry(inode, dentry_cursor);
+            dentry_to_free = dentry_cursor;
+            dentry_cursor = dentry_cursor->brother;
+            free(dentry_to_free);
+        }
+    }
+
+    for (byte_cursor = 0; byte_cursor < NFS_BLKS_SZ(nfs_super.map_inode_blks); 
+        byte_cursor++)                            /* 调整inodemap */
+    {
+        for (bit_cursor = 0; bit_cursor < UINT8_BITS; bit_cursor++) {
+            if (ino_cursor == inode->ino) {
+                    nfs_super.map_inode[byte_cursor] &= (uint8_t)(~(0x1 << bit_cursor));
+                    is_find = TRUE;
+                    break;
+            }
+            ino_cursor++;
+        }
+        if (is_find == TRUE) {
+            break;
+        }
+    }
+
+    for (byte_cursor = 0; byte_cursor < NFS_BLKS_SZ(nfs_super.map_data_blks); 
+        byte_cursor++)                            /* 调整inodemap */
+    {
+        for (bit_cursor = 0; bit_cursor < UINT8_BITS; bit_cursor++) {
+            if (data_cursor == inode->ino) {
+                    nfs_super.map_data[byte_cursor] &= (uint8_t)(~(0x1 << bit_cursor));
+                    is_find = TRUE;
+                    break;
+            }
+            data_cursor++;
+        }
+        if (is_find == TRUE) {
+            break;
+        }
+    }
+
+    if (inode->data)
+        free(inode->data);
+    free(inode);
 
     return NFS_ERROR_NONE;
 }
